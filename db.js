@@ -177,6 +177,7 @@ export async function initDb() {
     quantity     INT DEFAULT 100
   )`);
   try { await pool.execute(`ALTER TABLE designs ADD COLUMN quantity INT DEFAULT 100`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE designs ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`); } catch (_) { }
 
   // Materials
   await pool.execute(`CREATE TABLE IF NOT EXISTS materials (
