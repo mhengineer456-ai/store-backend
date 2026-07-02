@@ -1117,7 +1117,7 @@ if (fs.existsSync(distPath)) {
 
 // Start Server
 const server = app.listen(PORT, () => {
-  console.log(`G-PDMS Auth Server running on http://localhost:${PORT}`);
+  console.log(`G-PDMS Auth Server running on http://localhost:${PORT} (or https://store-backend-1-ff8d.onrender.com)`);
 });
 
 server.on('error', (err) => {

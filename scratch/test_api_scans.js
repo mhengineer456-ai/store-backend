@@ -1,6 +1,6 @@
 async function main() {
   try {
-    const res = await fetch('http://localhost:5000/api/scans');
+    const res = await fetch('https://store-backend-1-ff8d.onrender.com/api/scans');
     console.log('Response status:', res.status);
     if (res.ok) {
       const data = await res.json();
