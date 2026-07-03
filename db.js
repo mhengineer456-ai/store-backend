@@ -661,7 +661,32 @@ export const getAllCuttingHeaders = async () => {
 };
 
 export const getAllDooriOrders = async () => {
-  const [rows] = await pool.execute('SELECT * FROM doori ORDER BY Timestamp DESC');
+  const [rows] = await pool.execute(`
+    SELECT 
+      ch.Lot_Number,
+      ch.Garment_Type,
+      ch.Style,
+      ch.Fabric,
+      COALESCE(ch.Cutting_Qty, ch.Stitching_Issue_Qty, 0) as Total_Pieces,
+      COALESCE(d.Issue_Date, ch.Date_of_Issue, ch.JobOrder_Date, '') as Issue_Date,
+      COALESCE(d.Timestamp, ch.JobOrder_Date, '') as Timestamp,
+      COALESCE(d.Supervisor, ch.Supervisor, '') as Supervisor,
+      d.Dori_Selections,
+      d.Selected_Placements,
+      d.Placement_Quantities,
+      d.Placement_Dori_Types,
+      d.Total_Cost,
+      d.Gate_Entry_Person,
+      d.Gate_Entry_Date,
+      d.Material_Received_By,
+      d.Material_Received_Date,
+      d.Supplier_Name,
+      d.Material_Entry_Date,
+      d.dori_payload
+    FROM cutting_header ch
+    LEFT JOIN doori d ON ch.Lot_Number = d.Lot_Number
+    ORDER BY ch.Saved_At DESC
+  `);
   return rows;
 };
 
@@ -673,23 +698,77 @@ export const updateCuttingHeaderPayload = async (lotNo, payload) => {
 };
 
 export const updateDooriPayload = async (lotNo, data) => {
-  await pool.execute(
-    `UPDATE doori SET 
-       dori_payload = ?,
-       Dori_Selections = ?,
-       Selected_Placements = ?,
-       Placement_Quantities = ?,
-       Placement_Dori_Types = ?
-     WHERE Lot_Number = ?`,
-    [
-      data.dori_payload,
-      data.Dori_Selections,
-      data.Selected_Placements,
-      data.Placement_Quantities,
-      data.Placement_Dori_Types,
-      lotNo
-    ]
-  );
+  const [existing] = await pool.execute('SELECT 1 FROM doori WHERE Lot_Number = ?', [lotNo]);
+  if (existing.length > 0) {
+    await pool.execute(
+      `UPDATE doori SET 
+         dori_payload = ?,
+         Dori_Selections = ?,
+         Selected_Placements = ?,
+         Placement_Quantities = ?,
+         Placement_Dori_Types = ?
+       WHERE Lot_Number = ?`,
+      [
+        data.dori_payload,
+        data.Dori_Selections,
+        data.Selected_Placements,
+        data.Placement_Quantities,
+        data.Placement_Dori_Types,
+        lotNo
+      ]
+    );
+  } else {
+    const [cutting] = await pool.execute('SELECT * FROM cutting_header WHERE Lot_Number = ?', [lotNo]);
+    const cutRow = cutting[0] || {};
+    await pool.execute(
+      `INSERT INTO doori (
+         Lot_Number, Garment_Type, Style, Fabric, Total_Pieces, Issue_Date, Supervisor,
+         dori_payload, Dori_Selections, Selected_Placements, Placement_Quantities, Placement_Dori_Types, Total_Cost
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        lotNo,
+        cutRow.Garment_Type || '',
+        cutRow.Style || '',
+        cutRow.Fabric || '',
+        parseInt(cutRow.Cutting_Qty || cutRow.Stitching_Issue_Qty) || 0,
+        cutRow.Date_of_Issue || cutRow.JobOrder_Date || '',
+        cutRow.Supervisor || '',
+        data.dori_payload,
+        data.Dori_Selections,
+        data.Selected_Placements,
+        data.Placement_Quantities,
+        data.Placement_Dori_Types,
+        0.0
+      ]
+    );
+  }
+};
+
+export const resetLotOperationalData = async (lotNo) => {
+  const lotNoLower = lotNo.trim().toLowerCase();
+  
+  // 1. Delete scans
+  await pool.execute('DELETE FROM scans WHERE LOWER(lot_number) = ?', [lotNoLower]);
+  
+  // 2. Delete doori payload/order
+  await pool.execute('DELETE FROM doori WHERE LOWER(Lot_Number) = ?', [lotNoLower]);
+  
+  // 3. Delete cutting header (Zip PO) and matrix rows
+  await pool.execute('DELETE FROM cuttings_matrix WHERE LOWER(Lot_No) = ?', [lotNoLower]);
+  await pool.execute('DELETE FROM cutting_header WHERE LOWER(Lot_Number) = ?', [lotNoLower]);
+  
+  // 4. Delete issue logs
+  await pool.execute('DELETE FROM issue_logs WHERE LOWER(lotId) = ?', [lotNoLower]);
+  
+  // 5. Delete approval requests
+  await pool.execute('DELETE FROM approval_requests WHERE LOWER(lotId) = ?', [lotNoLower]);
+  
+  // 6. Delete design history log
+  await pool.execute('DELETE FROM design_history WHERE LOWER(lot_number) = ?', [lotNoLower]);
+  
+  // 7. Delete purchase orders that contain this lot
+  await pool.execute('DELETE FROM purchase_orders WHERE items LIKE ?', [`%"lotNumber":"${lotNo}"%`]);
+  await pool.execute('DELETE FROM purchase_orders WHERE items LIKE ?', [`%"lotNumber":"${lotNoLower}"%`]);
 };
 
 // ── Export pool as default ────────────────────────────────────────────────────

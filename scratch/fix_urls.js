@@ -86,3 +86,5 @@ for (const entry of filesToFix) {
   const fullPath = path.join(srcDir, entry.file);
   fixFile(fullPath, entry.isApp || false);
 }
+
+

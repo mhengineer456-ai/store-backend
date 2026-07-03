@@ -44,7 +44,8 @@ import {
   getAllCuttingHeaders,
   getAllDooriOrders,
   updateCuttingHeaderPayload,
-  updateDooriPayload
+  updateDooriPayload,
+  resetLotOperationalData
 } from './db.js';
 
 dotenv.config();
@@ -670,6 +671,23 @@ app.post('/api/designs', async (req, res) => {
     const actorName = design.actorName || 'Designer';
     delete design.actorName;
 
+    const isEdit = !!design.isEdit;
+    delete design.isEdit;
+
+    // Check if the lot ID already exists. If yes and NOT an edit, auto-version it to save both runs!
+    if (!isEdit) {
+      const [existing] = await pool.execute('SELECT id FROM designs WHERE id = ?', [design.id]);
+      if (existing.length > 0) {
+        const [versions] = await pool.execute(
+          'SELECT id FROM designs WHERE id LIKE ?',
+          [`${design.id}-V%`]
+        );
+        const nextVersion = versions.length + 2; // Original is 1, first recreated is -V2, next is -V3
+        design.id = `${design.id}-V${nextVersion}`;
+        design.lotNo = design.id;
+      }
+    }
+
     const serialized = {
       ...design,
       bom: typeof design.bom === 'object' ? JSON.stringify(design.bom) : design.bom
@@ -969,7 +987,7 @@ app.get('/api/cutting/:lotNo', async (req, res) => {
     const lotNo = req.params.lotNo;
     const result = await getCuttingMatrixByLot(lotNo);
     if (!result) {
-      return res.status(404).json({ error: `Lot ${lotNo} not found.` });
+      return res.status(200).json({ header: null, rows: [] });
     }
     res.status(200).json(result);
   } catch (err) {
@@ -1050,7 +1068,8 @@ app.get('/api/public/lot/:lotNo', async (req, res) => {
       category: design.category,
       style: design.style,
       quantity: design.quantity,
-      date: design.date
+      date: design.date,
+      status: design.status
     });
   } catch (err) {
     console.error('API GET /api/public/lot/:lotNo error:', err.message);
