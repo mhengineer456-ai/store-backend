@@ -178,8 +178,8 @@ export async function initDb() {
   )`);
   try { await pool.execute(`ALTER TABLE designs ADD COLUMN quantity INT DEFAULT 100`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE designs ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE designs ADD COLUMN repeat_against VARCHAR(100) NULL`); } catch (_) { }
 
-  // Materials
   await pool.execute(`CREATE TABLE IF NOT EXISTS materials (
     id         VARCHAR(100) PRIMARY KEY,
     name       VARCHAR(255) NOT NULL,
@@ -188,8 +188,14 @@ export async function initDb() {
     unit       VARCHAR(50),
     cost       DOUBLE DEFAULT 0,
     threshold  DOUBLE DEFAULT 0,
-    color      VARCHAR(100)
+    color      VARCHAR(100),
+    packets    INT DEFAULT 1,
+    poNumber   VARCHAR(100) DEFAULT 'N/A',
+    invoiceNo  VARCHAR(100) DEFAULT 'N/A'
   )`);
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN packets INT DEFAULT 1`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN poNumber VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN invoiceNo VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
 
   // Approval Requests
   await pool.execute(`CREATE TABLE IF NOT EXISTS approval_requests (
@@ -281,6 +287,84 @@ export async function initDb() {
     rgp_payload    TEXT NULL
   )`);
 
+  // ZIP PO Orders Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS zip (
+    id                   INT PRIMARY KEY AUTO_INCREMENT,
+    Lot_Number           VARCHAR(100) NOT NULL UNIQUE,
+    Garment_Type         VARCHAR(255) DEFAULT '',
+    Style                VARCHAR(255) DEFAULT '',
+    Fabric               VARCHAR(255) DEFAULT '',
+    Total_Pieces         INT DEFAULT 0,
+    Issue_Date           VARCHAR(100) DEFAULT '',
+    Supervisor           VARCHAR(255) DEFAULT '',
+    Priority             VARCHAR(100) DEFAULT 'Normal',
+    Selected_Placements  TEXT,
+    Placement_Quantities TEXT,
+    Placement_Zip_Types  TEXT,
+    Zip_Selections       TEXT,
+    Zip_Quality_Data     TEXT,
+    Total_Cost           DOUBLE DEFAULT 0,
+    Saved_At             TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    Gate_Entry_Person    VARCHAR(255) DEFAULT '',
+    Gate_Entry_Date      VARCHAR(100) DEFAULT '',
+    Material_Received_By VARCHAR(255) DEFAULT '',
+    Material_Received_Date VARCHAR(100) DEFAULT '',
+    Supplier_Name        VARCHAR(255) DEFAULT '',
+    Material_Entry_Date  VARCHAR(100) DEFAULT '',
+    zip_payload          LONGTEXT
+  )`);
+  // Add scanner columns to zip if upgrading from older schema
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN Gate_Entry_Person VARCHAR(255) DEFAULT ''`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN Gate_Entry_Date VARCHAR(100) DEFAULT ''`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN Material_Received_By VARCHAR(255) DEFAULT ''`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN Material_Received_Date VARCHAR(100) DEFAULT ''`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN Supplier_Name VARCHAR(255) DEFAULT ''`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN Material_Entry_Date VARCHAR(100) DEFAULT ''`); } catch(_) {}
+  // Add PO number column to zip
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN po_number VARCHAR(30) DEFAULT ''`); } catch(_) {}
+  // Drop UNIQUE constraint on Lot_Number in zip table so same lot can have multiple orders (new SR NO each time)
+  try { await pool.execute(`ALTER TABLE zip DROP INDEX Lot_Number`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE zip DROP INDEX lot_number`); } catch(_) {}
+  // Add version column so duplicate lots are tracked as Version 1, Version 2, etc.
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN version INT DEFAULT 1`); } catch(_) {}
+  // Add PO number column to doori
+  try { await pool.execute(`ALTER TABLE doori ADD COLUMN po_number VARCHAR(30) DEFAULT ''`); } catch(_) {}
+  // Drop UNIQUE constraint on Lot_Number in doori — same lot can have multiple versioned orders
+  try { await pool.execute(`ALTER TABLE doori DROP INDEX Lot_Number`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE doori DROP INDEX lot_number`); } catch(_) {}
+  // Add version column to doori so duplicate lots show as Version 1, Version 2, etc.
+  try { await pool.execute(`ALTER TABLE doori ADD COLUMN version INT DEFAULT 1`); } catch(_) {}
+  // Seed PO counters if missing
+  try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('zip_po_counter', '0')`); } catch(_) {}
+  try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('doori_po_counter', '0')`); } catch(_) {}
+
+
+
+  // DOORI PO Orders Table (ensure all columns exist)
+  await pool.execute(`CREATE TABLE IF NOT EXISTS doori (
+    id                   INT PRIMARY KEY AUTO_INCREMENT,
+    Lot_Number           VARCHAR(100) NOT NULL UNIQUE,
+    Garment_Type         VARCHAR(255) DEFAULT '',
+    Style                VARCHAR(255) DEFAULT '',
+    Fabric               VARCHAR(255) DEFAULT '',
+    Total_Pieces         INT DEFAULT 0,
+    Issue_Date           VARCHAR(100) DEFAULT '',
+    Timestamp            VARCHAR(100) DEFAULT '',
+    Supervisor           VARCHAR(255) DEFAULT '',
+    Dori_Selections      TEXT,
+    Selected_Placements  TEXT,
+    Placement_Quantities TEXT,
+    Placement_Dori_Types TEXT,
+    Total_Cost           DOUBLE DEFAULT 0,
+    Gate_Entry_Person    VARCHAR(255) DEFAULT '',
+    Gate_Entry_Date      VARCHAR(100) DEFAULT '',
+    Material_Received_By VARCHAR(255) DEFAULT '',
+    Material_Received_Date VARCHAR(100) DEFAULT '',
+    Supplier_Name        VARCHAR(255) DEFAULT '',
+    Material_Entry_Date  VARCHAR(100) DEFAULT '',
+    dori_payload         LONGTEXT
+  )`);
+
   // ── Seed data (only if tables are empty) ────────────────────────────────────
 
   const [[{ count: dCount }]] = await pool.execute('SELECT COUNT(*) as count FROM designs');
@@ -351,6 +435,49 @@ export async function initDb() {
     await pool.execute("INSERT INTO design_history (lotId, action, actorName, timestamp, details) VALUES ('11002', 'approved', 'Admin', '02/08/2023 14:12', 'BOM verified and approved.')");
   }
 
+  // Weight Capture (Weighbridge Audit Log)
+  await pool.execute(`CREATE TABLE IF NOT EXISTS weight_capture (
+    id               INT PRIMARY KEY AUTO_INCREMENT,
+    materialCode     VARCHAR(50)   NOT NULL,
+    materialName     VARCHAR(255)  NOT NULL,
+    unit             VARCHAR(30)   DEFAULT 'Pcs',
+    category         VARCHAR(100)  DEFAULT '',
+    supplier         VARCHAR(255)  DEFAULT '',
+    lotNo            VARCHAR(100)  DEFAULT '',
+    poNumber         VARCHAR(100)  DEFAULT '',
+    invoiceNo        VARCHAR(100)  DEFAULT '',
+    storeLocation    VARCHAR(255)  DEFAULT '',
+    storeIncharge    VARCHAR(255)  DEFAULT '',
+    grossWeightKg    DOUBLE        DEFAULT 0,
+    tareWeightKg     DOUBLE        DEFAULT 0,
+    netWeightKg      DOUBLE        DEFAULT 0,
+    weightPerPieceG  DOUBLE        DEFAULT 0,
+    sampleQty        INT           DEFAULT 0,
+    sampleWeightKg   DOUBLE        DEFAULT 0,
+    pieces           INT           DEFAULT 0,
+    packets          INT           DEFAULT 1,
+    barcodeId        VARCHAR(100)  DEFAULT '',
+    status           VARCHAR(50)   DEFAULT 'Captured',
+    remarks          TEXT,
+    capturedAt       DATETIME      DEFAULT CURRENT_TIMESTAMP
+  )`);
+  // Add sampleQty/sampleWeightKg columns if upgrading from older schema
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN sampleQty INT DEFAULT 0`); } catch(_) {}
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN sampleWeightKg DOUBLE DEFAULT 0`); } catch(_) {}
+
+  // Material Transfers Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS material_transfers (
+    id               INT PRIMARY KEY AUTO_INCREMENT,
+    materialCode     VARCHAR(50)   NOT NULL,
+    materialName     VARCHAR(255)  NOT NULL,
+    fromLocation     VARCHAR(255)  NOT NULL,
+    toLocation       VARCHAR(255)  NOT NULL,
+    quantity         INT           DEFAULT 0,
+    transferType     VARCHAR(50)   DEFAULT 'packet',
+    operator         VARCHAR(255)  DEFAULT 'Admin',
+    transferredAt    DATETIME      DEFAULT CURRENT_TIMESTAMP
+  )`);
+
   console.log('[DB] All tables ready.');
 }
 
@@ -373,10 +500,138 @@ const toMysqlDatetime = (dateInput) => {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 };
 
+export const addOrUpdateMaterialFromCapture = async (data) => {
+  const name = (data.materialName || '').trim();
+  const code = (data.materialCode || '').trim();
+  const pieces = Number(data.pieces) || 0;
+  const packets = Number(data.packets) || 1;
+  const unit = data.unit || 'Pcs';
+  const category = data.category || 'Accessory';
+  const location = data.storeLocation || 'Main Store';
+  const poNumber = data.poNumber || 'N/A';
+  const invoiceNo = data.invoiceNo || 'N/A';
+
+  if (!name && !code) return;
+
+  // Search by exact id (materialCode) first if present
+  let rows = [];
+  if (code) {
+    const [idRows] = await pool.execute('SELECT * FROM materials WHERE id = ?', [code]);
+    rows = idRows;
+  }
+  // Fall back to matching name only if no materialCode was provided
+  if (rows.length === 0 && name && !code) {
+    const [nameRows] = await pool.execute('SELECT * FROM materials WHERE name = ?', [name]);
+    rows = nameRows;
+  }
+
+  if (rows.length > 0) {
+    // Existing material found -> add pieces to stock and update packets
+    const existing = rows[0];
+    const updatedStock = (Number(existing.stock) || 0) + pieces;
+    await pool.execute(
+      'UPDATE materials SET stock = ?, packets = ?, unit = COALESCE(NULLIF(?, ""), unit), name = COALESCE(NULLIF(?, ""), name), color = COALESCE(NULLIF(?, ""), color), category = COALESCE(NULLIF(?, ""), category), poNumber = COALESCE(NULLIF(?, ""), poNumber), invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo) WHERE id = ?',
+      [updatedStock, packets, data.unit || existing.unit, name || existing.name, location || existing.color, category || existing.category, poNumber || existing.poNumber, invoiceNo || existing.invoiceNo, existing.id]
+    );
+    console.log(`[DB] Updated stock for material ${existing.id} (${existing.name}): +${pieces} (New total: ${updatedStock}, Packets: ${packets}, PO: ${poNumber}, Invoice: ${invoiceNo})`);
+  } else {
+    // New material -> insert into materials table
+    const matId = code || `M${Math.floor(1000 + Math.random() * 9000)}`;
+    await pool.execute(
+      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, location, packets, poNumber, invoiceNo]
+    );
+    console.log(`[DB] Created new material in Stock DB: ${matId} - ${name} (${pieces} ${unit}, ${packets} packets, PO: ${poNumber}, Invoice: ${invoiceNo})`);
+  }
+};
+
+export const syncWeightCapturesToMaterials = async () => {
+  try {
+    const [captures] = await pool.execute('SELECT * FROM weight_capture ORDER BY id ASC');
+    for (const c of captures) {
+      if (!c.materialCode) continue;
+      const code = c.materialCode;
+      const name = c.materialName || 'Accessory Material';
+      const category = c.category || 'Accessory';
+      const pieces = Number(c.pieces) || 0;
+      const unit = c.unit || 'Pcs';
+      const location = c.storeLocation || 'Main Store';
+      const packets = Number(c.packets) || 1;
+      const poNumber = c.poNumber || 'N/A';
+      const invoiceNo = c.invoiceNo || 'N/A';
+
+      const [existing] = await pool.execute('SELECT * FROM materials WHERE id = ?', [code]);
+      if (existing.length > 0) {
+        // If material exists, DO NOT overwrite custom user configurations like color/location, packets, PO/Invoice numbers.
+        // We only update name, category, and unit if they are empty or default.
+        const ext = existing[0];
+        const newName = ext.name === 'Accessory Material' || !ext.name ? name : ext.name;
+        const newCategory = ext.category === 'Accessory' || !ext.category ? category : ext.category;
+        const newUnit = !ext.unit ? unit : ext.unit;
+        await pool.execute(
+          'UPDATE materials SET name = ?, category = ?, unit = ? WHERE id = ?',
+          [newName, newCategory, newUnit, code]
+        );
+      } else {
+        // Insert missing material (such as MT1009) into materials DB table
+        await pool.execute(
+          'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [code, name, category, pieces, unit, 0, 50, location, packets, poNumber, invoiceNo]
+        );
+        console.log(`[DB] Synced missing weight capture material into DB: ${code} - ${name} (PO: ${poNumber}, Invoice: ${invoiceNo})`);
+      }
+    }
+  } catch (err) {
+    console.error('[DB] Error syncing weight captures to materials:', err.message);
+  }
+};
+
 export const getUserByEmail = async (email) => {
   const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
   return rows[0] || null;
 };
+
+// ── Material Capture & Stock Sync ─────────────────────────────────────────────
+
+export const createMaterialCapture = async (data) => {
+  const {
+    materialCode, materialName, unit = 'Pcs', category = '', supplier = '',
+    lotNo = '', poNumber = '', invoiceNo = '', storeLocation = '', storeIncharge = '',
+    grossWeightKg = 0, tareWeightKg = 0, netWeightKg = 0, weightPerPieceG = 0,
+    sampleQty = 0, sampleWeightKg = 0,
+    pieces = 0, packets = 1, barcodeId = '', status = 'Captured', remarks = ''
+  } = data;
+  const [result] = await pool.execute(
+    `INSERT INTO weight_capture
+     (materialCode,materialName,unit,category,supplier,lotNo,poNumber,invoiceNo,
+      storeLocation,storeIncharge,grossWeightKg,tareWeightKg,netWeightKg,
+      weightPerPieceG,sampleQty,sampleWeightKg,pieces,packets,barcodeId,status,remarks)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo,
+     storeLocation, storeIncharge,
+     Number(grossWeightKg), Number(tareWeightKg), Number(netWeightKg),
+     Number(weightPerPieceG), Number(sampleQty), Number(sampleWeightKg),
+     Number(pieces), Number(packets),
+     barcodeId, status, remarks]
+  );
+
+  // Sync material to materials stock database table
+  try {
+    await addOrUpdateMaterialFromCapture(data);
+  } catch (syncErr) {
+    console.error('[DB] Material stock sync error:', syncErr.message);
+  }
+
+  return result.insertId;
+};
+
+export const getAllMaterialCaptures = async () => {
+  const [rows] = await pool.execute(
+    'SELECT * FROM weight_capture ORDER BY capturedAt DESC'
+  );
+  return rows;
+};
+
 
 export const getUserById = async (id) => {
   const [rows] = await pool.execute('SELECT * FROM users WHERE id = ?', [id]);
@@ -416,6 +671,7 @@ export const getDesignById = async (id) => {
 };
 
 export const createDesign = async (d) => {
+  const repeatAgainst = d.repeat_against || null;
   if (d.created_at) {
     const localDate = new Date(d.created_at);
     const pad = n => String(n).padStart(2, '0');
@@ -424,22 +680,22 @@ export const createDesign = async (d) => {
       `REPLACE INTO designs
         (id,name,lotNo2,brand,category,designer,fabricType,targetSizes,colorCode,status,date,
          comments,section,season,style,tapeLace,bottomType,zip,sticker,collar,bone,fullBaju,
-         bom,totalCost,imageUrl,quantity,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         bom,totalCost,imageUrl,quantity,created_at,repeat_against)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [d.id, d.name, d.lotNo2, d.brand, d.category, d.designer, d.fabricType, d.targetSizes,
        d.colorCode, d.status, d.date, d.comments || '', d.section, d.season, d.style, d.tapeLace,
-       d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', d.quantity || 100, dbDate]
+       d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', d.quantity || 100, dbDate, repeatAgainst]
     );
   } else {
     await pool.execute(
       `REPLACE INTO designs
         (id,name,lotNo2,brand,category,designer,fabricType,targetSizes,colorCode,status,date,
          comments,section,season,style,tapeLace,bottomType,zip,sticker,collar,bone,fullBaju,
-         bom,totalCost,imageUrl,quantity)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         bom,totalCost,imageUrl,quantity,repeat_against)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [d.id, d.name, d.lotNo2, d.brand, d.category, d.designer, d.fabricType, d.targetSizes,
        d.colorCode, d.status, d.date, d.comments || '', d.section, d.season, d.style, d.tapeLace,
-       d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', d.quantity || 100]
+       d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', d.quantity || 100, repeatAgainst]
     );
   }
 };
@@ -451,15 +707,69 @@ export const updateDesignStatus = async (id, status, comments) => {
 // ── Materials ─────────────────────────────────────────────────────────────────
 
 export const getAllMaterials = async () => {
-  const [rows] = await pool.execute('SELECT * FROM materials');
+  await syncWeightCapturesToMaterials();
+  const [rows] = await pool.execute('SELECT * FROM materials ORDER BY id ASC');
   return rows;
 };
 
 export const upsertMaterial = async (m) => {
-  await pool.execute(
-    'REPLACE INTO materials (id,name,category,stock,unit,cost,threshold,color) VALUES (?,?,?,?,?,?,?,?)',
-    [m.id, m.name, m.category, m.stock, m.unit, m.cost, m.threshold, m.color || '']
-  );
+  const [existing] = await pool.execute('SELECT * FROM materials WHERE id = ?', [m.id]);
+  if (existing.length > 0) {
+    const ext = existing[0];
+    await pool.execute(
+      `UPDATE materials SET
+        name = ?,
+        category = ?,
+        stock = ?,
+        unit = ?,
+        cost = ?,
+        threshold = ?,
+        color = ?,
+        packets = ?,
+        poNumber = ?,
+        invoiceNo = ?
+       WHERE id = ?`,
+      [
+        m.name !== undefined ? m.name : ext.name,
+        m.category !== undefined ? m.category : ext.category,
+        m.stock !== undefined ? m.stock : ext.stock,
+        m.unit !== undefined ? m.unit : ext.unit,
+        m.cost !== undefined ? m.cost : ext.cost,
+        m.threshold !== undefined ? m.threshold : ext.threshold,
+        m.color !== undefined ? m.color : ext.color,
+        m.packets !== undefined ? m.packets : ext.packets,
+        m.poNumber !== undefined ? m.poNumber : ext.poNumber,
+        m.invoiceNo !== undefined ? m.invoiceNo : ext.invoiceNo,
+        m.id
+      ]
+    );
+
+    // Sync updated location and packets count back to weight_capture table so they match
+    if (m.color !== undefined) {
+      await pool.execute(
+        'UPDATE weight_capture SET storeLocation = ?, packets = ? WHERE materialCode = ?',
+        [m.color, m.packets !== undefined ? m.packets : ext.packets, m.id]
+      );
+    }
+  } else {
+    await pool.execute(
+      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, packets, poNumber, invoiceNo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        m.id,
+        m.name || 'Accessory Material',
+        m.category || 'Accessory',
+        m.stock || 0,
+        m.unit || 'Pcs',
+        m.cost || 0,
+        m.threshold || 50,
+        m.color || '',
+        m.packets || 1,
+        m.poNumber || 'N/A',
+        m.invoiceNo || 'N/A'
+      ]
+    );
+  }
 };
 
 export const deleteMaterial = async (id) => {
@@ -633,8 +943,34 @@ export const getAllHistory = async () => {
   return rows;
 };
 
+// ── PO Number counter (atomic, stored in settings) ──────────────────────────
+export const getNextPoNumber = async (type) => {
+  // type = 'zip' → returns 'ZIP-PO-0001' | type = 'doori' → returns 'DORI-PO-0001'
+  const key = type === 'zip' ? 'zip_po_counter' : 'doori_po_counter';
+  const prefix = type === 'zip' ? 'ZIP-PO' : 'DORI-PO';
+
+  // Use a transaction to safely increment
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ? FOR UPDATE', [key]);
+    const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
+    const next = (parseInt(row?.setting_value || '0') + 1);
+    await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
+    await conn.commit();
+    // Format: ZIP-PO-0001 (padded to 4 digits)
+    return `${prefix}-${String(next).padStart(4, '0')}`;
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+};
+
 // ── Scanner Log entries ───────────────────────────────────────────────────────
 export const createScanEntry = async (scan) => {
+  // 1. Always insert into scans table
   await pool.execute(
     `INSERT INTO scans (lot_number, scan_type, person_name, material_name, quantity, supplier_name, rgp_payload)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -648,7 +984,69 @@ export const createScanEntry = async (scan) => {
       scan.rgp_payload || null
     ]
   );
+
+  // 2. Mirror scan data into doori + zip tables based on scan_type
+  const lotNo = scan.lot_number || '';
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+
+  if (scan.scan_type === 'gate_entry') {
+    // Update doori table
+    await pool.execute(
+      `UPDATE doori SET
+         Gate_Entry_Person = ?,
+         Gate_Entry_Date   = ?,
+         Supplier_Name     = ?,
+         Material_Entry_Date = ?
+       WHERE LOWER(Lot_Number) = LOWER(?)`,
+      [scan.person_name, now, scan.supplier_name, now, lotNo]
+    );
+    // Update zip table — only update the latest row for this lot (highest id)
+    await pool.execute(
+      `UPDATE zip SET
+         Gate_Entry_Person = ?,
+         Gate_Entry_Date   = ?,
+         Supplier_Name     = ?,
+         Material_Entry_Date = ?
+       WHERE id = (SELECT max_id FROM (SELECT MAX(id) as max_id FROM zip WHERE LOWER(Lot_Number) = LOWER(?)) AS sub)`,
+      [scan.person_name, now, scan.supplier_name, now, lotNo]
+    ).catch(() => {}); // zip may not have these columns yet — added below
+
+  } else if (scan.scan_type === 'material_in') {
+    await pool.execute(
+      `UPDATE doori SET
+         Material_Received_By   = ?,
+         Material_Received_Date = ?
+       WHERE LOWER(Lot_Number) = LOWER(?)`,
+      [scan.person_name, now, lotNo]
+    );
+    // Update only the latest zip row for this lot
+    await pool.execute(
+      `UPDATE zip SET
+         Material_Received_By   = ?,
+         Material_Received_Date = ?
+       WHERE id = (SELECT max_id FROM (SELECT MAX(id) as max_id FROM zip WHERE LOWER(Lot_Number) = LOWER(?)) AS sub)`,
+      [scan.person_name, now, lotNo]
+    ).catch(() => {});
+
+  } else if (scan.scan_type === 'supplier_entry') {
+    await pool.execute(
+      `UPDATE doori SET
+         Supplier_Name       = ?,
+         Material_Entry_Date = ?
+       WHERE LOWER(Lot_Number) = LOWER(?)`,
+      [scan.supplier_name, now, lotNo]
+    );
+    // Update only the latest zip row for this lot
+    await pool.execute(
+      `UPDATE zip SET
+         Supplier_Name       = ?,
+         Material_Entry_Date = ?
+       WHERE id = (SELECT max_id FROM (SELECT MAX(id) as max_id FROM zip WHERE LOWER(Lot_Number) = LOWER(?)) AS sub)`,
+      [scan.supplier_name, now, lotNo]
+    ).catch(() => {});
+  }
 };
+
 
 export const getAllScans = async () => {
   const [rows] = await pool.execute('SELECT * FROM scans ORDER BY scanned_at DESC');
@@ -663,19 +1061,22 @@ export const getAllCuttingHeaders = async () => {
 export const getAllDooriOrders = async () => {
   const [rows] = await pool.execute(`
     SELECT 
-      ch.Lot_Number,
-      ch.Garment_Type,
-      ch.Style,
-      ch.Fabric,
-      COALESCE(ch.Cutting_Qty, ch.Stitching_Issue_Qty, 0) as Total_Pieces,
-      COALESCE(d.Issue_Date, ch.Date_of_Issue, ch.JobOrder_Date, '') as Issue_Date,
-      COALESCE(d.Timestamp, ch.JobOrder_Date, '') as Timestamp,
-      COALESCE(d.Supervisor, ch.Supervisor, '') as Supervisor,
+      d.id,
+      d.Lot_Number,
+      d.version,
+      d.Garment_Type,
+      d.Style,
+      d.Fabric,
+      d.Total_Pieces,
+      d.Issue_Date,
+      d.Timestamp,
+      d.Supervisor,
       d.Dori_Selections,
       d.Selected_Placements,
       d.Placement_Quantities,
       d.Placement_Dori_Types,
       d.Total_Cost,
+      d.po_number,
       d.Gate_Entry_Person,
       d.Gate_Entry_Date,
       d.Material_Received_By,
@@ -683,66 +1084,172 @@ export const getAllDooriOrders = async () => {
       d.Supplier_Name,
       d.Material_Entry_Date,
       d.dori_payload
-    FROM cutting_header ch
-    LEFT JOIN doori d ON ch.Lot_Number = d.Lot_Number
-    ORDER BY ch.Saved_At DESC
+    FROM doori d
+    ORDER BY d.Lot_Number ASC, d.version ASC
   `);
   return rows;
 };
 
+
+
+export const getAllZipOrders = async () => {
+  const [rows] = await pool.execute(`
+    SELECT
+      z.id,
+      z.Lot_Number,
+      z.version,
+      z.Garment_Type,
+      z.Style,
+      z.Fabric,
+      z.Total_Pieces,
+      z.Issue_Date,
+      z.Supervisor,
+      z.Priority,
+      z.Selected_Placements,
+      z.Placement_Quantities,
+      z.Placement_Zip_Types,
+      z.Zip_Selections,
+      z.Zip_Quality_Data,
+      z.Total_Cost,
+      z.po_number,
+      z.Gate_Entry_Person,
+      z.Gate_Entry_Date,
+      z.Material_Received_By,
+      z.Material_Received_Date,
+      z.Supplier_Name,
+      z.Material_Entry_Date,
+      z.Saved_At,
+      z.zip_payload,
+      COALESCE(ch.Garment_Type, z.Garment_Type, '') as ch_garment,
+      COALESCE(ch.Style, z.Style, '') as ch_style,
+      COALESCE(ch.Fabric, z.Fabric, '') as ch_fabric,
+      COALESCE(ch.Party_Name, '') as Brand,
+      COALESCE(ch.Cutting_Qty, ch.Stitching_Issue_Qty, z.Total_Pieces, 0) as Total_Pieces_CH
+    FROM zip z
+    LEFT JOIN cutting_header ch ON z.Lot_Number = ch.Lot_Number
+    ORDER BY z.Lot_Number ASC, z.version ASC
+  `);
+  return rows;
+};
+
+
 export const updateCuttingHeaderPayload = async (lotNo, payload) => {
+  // 1. Update the JSON payload column in cutting_header
   await pool.execute(
     'UPDATE cutting_header SET zip_payload = ? WHERE Lot_Number = ?',
     [payload, lotNo]
   );
+
+  // 2. Also upsert structured data into the dedicated zip table
+  try {
+    const parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
+    await upsertZipOrder(lotNo, parsed, payload);
+  } catch (e) {
+    console.warn('[DB] Could not upsert zip table:', e.message);
+  }
+};
+
+export const upsertZipOrder = async (lotNo, data, rawPayload) => {
+  // Resolve garment info from cutting_header
+  const [cutting] = await pool.execute('SELECT * FROM cutting_header WHERE Lot_Number = ?', [lotNo]);
+  const cutRow = cutting[0] || {};
+
+  const selPlacements = JSON.stringify(data.selectedPlacements || []);
+  const plQty         = JSON.stringify(data.placementQuantities || {});
+  const plZipTypes    = JSON.stringify(data.placementZipTypes || {});
+  const zipSel        = JSON.stringify(data.zipSelections || {});
+  const zipQuality    = JSON.stringify(data.zipQualityData || []);
+  const totalPieces   = parseInt(cutRow.Cutting_Qty || cutRow.Stitching_Issue_Qty) || 0;
+  const payloadStr    = typeof rawPayload === 'string' ? rawPayload : JSON.stringify(rawPayload || data);
+
+  // Count how many orders already exist for this lot to compute the next version number
+  const [[{ existingCount }]] = await pool.execute(
+    'SELECT COUNT(*) as existingCount FROM zip WHERE Lot_Number = ?',
+    [lotNo]
+  );
+  const nextVersion = parseInt(existingCount) + 1;
+
+  // ALWAYS INSERT a new row — same lot gets a new id and an incremented version number.
+  // Version 1 = first order, Version 2 = second order for same lot, etc.
+  await pool.execute(
+    `INSERT INTO zip (
+       Lot_Number, version, Garment_Type, Style, Fabric, Total_Pieces, Issue_Date, Supervisor, Priority,
+       Selected_Placements, Placement_Quantities, Placement_Zip_Types, Zip_Selections, Zip_Quality_Data,
+       Total_Cost, po_number, zip_payload
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      lotNo,
+      nextVersion,
+      cutRow.Garment_Type || '',
+      cutRow.Style || '',
+      cutRow.Fabric || '',
+      totalPieces,
+      data.issueDate || cutRow.Date_of_Issue || '',
+      data.supervisor || cutRow.Supervisor || '',
+      data.priority || 'Normal',
+      selPlacements,
+      plQty,
+      plZipTypes,
+      zipSel,
+      zipQuality,
+      parseFloat(data.totalCost || 0),
+      data.poNumber || '',
+      payloadStr
+    ]
+  );
 };
 
 export const updateDooriPayload = async (lotNo, data) => {
-  const [existing] = await pool.execute('SELECT 1 FROM doori WHERE Lot_Number = ?', [lotNo]);
-  if (existing.length > 0) {
-    await pool.execute(
-      `UPDATE doori SET 
-         dori_payload = ?,
-         Dori_Selections = ?,
-         Selected_Placements = ?,
-         Placement_Quantities = ?,
-         Placement_Dori_Types = ?
-       WHERE Lot_Number = ?`,
-      [
-        data.dori_payload,
-        data.Dori_Selections,
-        data.Selected_Placements,
-        data.Placement_Quantities,
-        data.Placement_Dori_Types,
-        lotNo
-      ]
-    );
-  } else {
-    const [cutting] = await pool.execute('SELECT * FROM cutting_header WHERE Lot_Number = ?', [lotNo]);
-    const cutRow = cutting[0] || {};
-    await pool.execute(
-      `INSERT INTO doori (
-         Lot_Number, Garment_Type, Style, Fabric, Total_Pieces, Issue_Date, Supervisor,
-         dori_payload, Dori_Selections, Selected_Placements, Placement_Quantities, Placement_Dori_Types, Total_Cost
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        lotNo,
-        cutRow.Garment_Type || '',
-        cutRow.Style || '',
-        cutRow.Fabric || '',
-        parseInt(cutRow.Cutting_Qty || cutRow.Stitching_Issue_Qty) || 0,
-        cutRow.Date_of_Issue || cutRow.JobOrder_Date || '',
-        cutRow.Supervisor || '',
-        data.dori_payload,
-        data.Dori_Selections,
-        data.Selected_Placements,
-        data.Placement_Quantities,
-        data.Placement_Dori_Types,
-        0.0
-      ]
-    );
-  }
+  const totalCost = parseFloat(data.Total_Cost || 0);
+  const poNumber  = data.po_number || '';
+
+  // Get cutting_header for garment info and fallback supervisor/date
+  const [cutting] = await pool.execute('SELECT * FROM cutting_header WHERE Lot_Number = ?', [lotNo]);
+  const cutRow = cutting[0] || {};
+
+  const supervisor  = data.Supervisor || data.supervisor || cutRow.Supervisor || '';
+  const issueDate   = data.Issue_Date || data.issueDate || cutRow.Date_of_Issue || cutRow.JobOrder_Date || '';
+  const garmentType = cutRow.Garment_Type || '';
+  const style       = cutRow.Style || '';
+  const fabric      = cutRow.Fabric || '';
+  const totalPieces = parseInt(cutRow.Cutting_Qty || cutRow.Stitching_Issue_Qty) || 0;
+
+  // Count how many doori orders already exist for this lot to compute next version
+  const [[{ existingCount }]] = await pool.execute(
+    'SELECT COUNT(*) as existingCount FROM doori WHERE Lot_Number = ?',
+    [lotNo]
+  );
+  const nextVersion = parseInt(existingCount) + 1;
+
+  // ALWAYS INSERT a new row — same lot gets a new id and incremented version.
+  // Version 1 = first order, Version 2 = re-created order, etc. Old data is NEVER modified.
+  await pool.execute(
+    `INSERT INTO doori (
+       Lot_Number, version, Garment_Type, Style, Fabric, Total_Pieces, Issue_Date, Supervisor,
+       dori_payload, Dori_Selections, Selected_Placements, Placement_Quantities, Placement_Dori_Types,
+       Total_Cost, po_number
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      lotNo,
+      nextVersion,
+      garmentType,
+      style,
+      fabric,
+      totalPieces,
+      issueDate,
+      supervisor,
+      data.dori_payload,
+      data.Dori_Selections,
+      data.Selected_Placements,
+      data.Placement_Quantities,
+      data.Placement_Dori_Types,
+      totalCost,
+      poNumber
+    ]
+  );
 };
+
+
 
 export const resetLotOperationalData = async (lotNo) => {
   const lotNoLower = lotNo.trim().toLowerCase();
@@ -769,6 +1276,69 @@ export const resetLotOperationalData = async (lotNo) => {
   // 7. Delete purchase orders that contain this lot
   await pool.execute('DELETE FROM purchase_orders WHERE items LIKE ?', [`%"lotNumber":"${lotNo}"%`]);
   await pool.execute('DELETE FROM purchase_orders WHERE items LIKE ?', [`%"lotNumber":"${lotNoLower}"%`]);
+};
+
+export const duplicateCuttingHeader = async (oldLotNo, newLotNo) => {
+  // Check if target already exists
+  const [existing] = await pool.execute('SELECT 1 FROM cutting_header WHERE Lot_Number = ?', [newLotNo]);
+  if (existing.length > 0) return;
+
+  // Get old row
+  const [rows] = await pool.execute('SELECT * FROM cutting_header WHERE Lot_Number = ?', [oldLotNo]);
+  if (rows.length === 0) return;
+
+  const oldRow = rows[0];
+  
+  // Insert new row cloning old values but with new lot number and empty zip_payload
+  const {
+    Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
+    Image_Url, Party_Name, Brand, Season, Direct_Stitching, Challan_History, Zip_Order_Date,
+    Zip_Received_Date, WIP_Status, Completed_Status, MWK, JobOrder_Date, Manpower,
+    Cutting_Qty, Stitching_Issue_Qty, Priority, Sticker
+  } = oldRow;
+
+  const [result] = await pool.execute(
+    `INSERT INTO cutting_header (
+      Lot_Number, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
+      Image_Url, Party_Name, Brand, Season, Direct_Stitching, Challan_History, Zip_Order_Date,
+      Zip_Received_Date, WIP_Status, Completed_Status, MWK, JobOrder_Date, Manpower,
+      Cutting_Qty, Stitching_Issue_Qty, Priority, Sticker, zip_payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+    [
+      newLotNo, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
+      Image_Url, Party_Name, Brand, Season, Direct_Stitching, Challan_History, Zip_Order_Date,
+      Zip_Received_Date, WIP_Status, Completed_Status, MWK, JobOrder_Date, Manpower,
+      Cutting_Qty, Stitching_Issue_Qty, Priority, Sticker
+    ]
+  );
+  
+  const newHeaderId = result.insertId;
+
+  // Also duplicate cuttings_matrix rows!
+  const [matrixRows] = await pool.execute('SELECT * FROM cuttings_matrix WHERE Lot_No = ?', [oldLotNo]);
+  for (const mRow of matrixRows) {
+    await pool.execute(
+      `INSERT INTO cuttings_matrix (
+        header_id, Lot_No, Color, Cutting_Table, M, L, XL, XXL, Total_Pcs
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        newHeaderId, newLotNo, mRow.Color, mRow.Cutting_Table, mRow.M, mRow.L, mRow.XL, mRow.XXL, mRow.Total_Pcs
+      ]
+    );
+  }
+};
+
+export const recordMaterialTransfer = async (t) => {
+  await pool.execute(
+    `INSERT INTO material_transfers (materialCode, materialName, fromLocation, toLocation, quantity, transferType, operator)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [t.materialCode, t.materialName, t.fromLocation, t.toLocation, t.quantity || 1, t.transferType || 'packet', t.operator || 'Admin']
+  );
+};
+
+export const getMaterialTransfers = async () => {
+  const [rows] = await pool.execute('SELECT * FROM material_transfers ORDER BY transferredAt DESC');
+  return rows;
 };
 
 // ── Export pool as default ────────────────────────────────────────────────────

@@ -45,8 +45,16 @@ import {
   getAllDooriOrders,
   updateCuttingHeaderPayload,
   updateDooriPayload,
-  resetLotOperationalData
+  resetLotOperationalData,
+  duplicateCuttingHeader,
+  getNextPoNumber,
+  getAllZipOrders,
+  createMaterialCapture,
+  getAllMaterialCaptures,
+  recordMaterialTransfer,
+  getMaterialTransfers
 } from './db.js';
+import pool from './db.js';
 
 dotenv.config();
 
@@ -57,6 +65,14 @@ const CACHE_DIR = path.join(__dirname, 'cache');
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
+
+// Prevent backend crashes from unhandled async errors
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Server] Unhandled Promise Rejection:', reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught Exception (server continues):', err.message);
+});
 
 // Automatic cache size management configurations
 const MAX_CACHE_SIZE = 500 * 1024 * 1024; // 500 MB limit
@@ -210,10 +226,14 @@ const authenticateToken = (req, res, next) => {
 // 1. User Registration Route
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { name, email, password, role, adminCode } = req.body;
+    const { name, email, password, role, securityCode, adminCode } = req.body;
 
-    if (!name || !email || !password || !role) {
+    if (!name || !email || !password || !role || !securityCode) {
       return res.status(400).json({ error: 'All fields are required.' });
+    }
+
+    if (securityCode.trim() !== 'MHSTORE2026@') {
+      return res.status(400).json({ error: 'Invalid Security Code. Use MHSTORE2026@ to register.' });
     }
 
     const emailRegex = /\S+@\S+\.\S+/;
@@ -243,20 +263,14 @@ app.post('/api/auth/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // OTP Details
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpires = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes expiry
-
     // Save in DB
-    await createUser(name, email, hashedPassword, role, otpCode, otpExpires);
+    await createUser(name, email, hashedPassword, role, null, null);
 
-    // Send OTP (real or simulated log)
-    const isRealEmailSent = await sendOtpEmail(email, name, otpCode);
+    // Instantly verify the user so they can log in
+    await verifyUserOtp(email);
 
     res.status(201).json({
-      message: 'Registration successful! Verification code sent.',
-      email,
-      simulatedOtp: isRealEmailSent ? null : otpCode // send to front-end for visual toast if SMTP is offline
+      message: 'Registration successful! You can now log in.'
     });
   } catch (err) {
     console.error('Registration API Error:', err.message);
@@ -350,14 +364,6 @@ app.post('/api/auth/login', async (req, res) => {
     const user = await getUserByEmail(email);
     if (!user) {
       return res.status(400).json({ error: 'Invalid email or password.' });
-    }
-
-    // Check OTP verification status
-    if (user.verified === 0) {
-      return res.status(403).json({
-        error: 'Please verify your email before logging in.',
-        notVerified: true
-      });
     }
 
     // Verify Password
@@ -460,40 +466,59 @@ function parseCSV(text) {
 
 // Helper: Get Lots CSV with local caching and offline fallback
 const LOTS_CSV_CACHE_PATH = path.join(CACHE_DIR, 'lots.csv');
-const CACHE_TTL_MS = 60 * 1000; // 1 minute TTL to keep data fresh but protect from rate limits
+const LOTS_CACHE_TIME_PATH = path.join(CACHE_DIR, 'lots_cache_time.txt');
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes TTL
 
+// Read persisted cache time from disk so restarts don't re-trigger fetch
 let lastFetchTime = 0;
+try {
+  if (fs.existsSync(LOTS_CACHE_TIME_PATH)) {
+    lastFetchTime = parseInt(fs.readFileSync(LOTS_CACHE_TIME_PATH, 'utf8') || '0', 10);
+  }
+} catch (_) { }
 
 async function getLotsCSV() {
   const url = 'https://docs.google.com/spreadsheets/d/13ArpFOD7idmpv7QIRJQkD-tfswtkH6rNnEANtv2M7Ek/export?format=csv&gid=0';
   const now = Date.now();
   const cacheExists = fs.existsSync(LOTS_CSV_CACHE_PATH);
 
-  // If cache is fresh, serve it directly
+  // If cache is still fresh, serve it directly
   if (cacheExists && (now - lastFetchTime < CACHE_TTL_MS)) {
     return fs.readFileSync(LOTS_CSV_CACHE_PATH, 'utf8');
   }
 
   try {
-    const response = await fetch(url);
+    // 10-second timeout to prevent indefinite hangs
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
     if (!response.ok) {
       throw new Error(`Google Sheets export failed with status ${response.status}: ${response.statusText}`);
     }
     const csvText = await response.text();
 
-    // Save to disk cache
+    // Save to disk cache and persist timestamp
     fs.writeFileSync(LOTS_CSV_CACHE_PATH, csvText, 'utf8');
     lastFetchTime = now;
+    fs.writeFileSync(LOTS_CACHE_TIME_PATH, String(now), 'utf8');
     return csvText;
   } catch (err) {
     console.error('[Cache Loader] Google Sheet fetch error:', err.message);
 
-    // Offline fallback: Serve stale cache if available
+    // Offline/timeout fallback: serve stale cache if available
     if (cacheExists) {
       console.warn('[Offline Fallback] Serving stale cached CSV.');
+      // Bump lastFetchTime to avoid retry storm
+      lastFetchTime = now;
+      fs.writeFileSync(LOTS_CACHE_TIME_PATH, String(now), 'utf8');
       return fs.readFileSync(LOTS_CSV_CACHE_PATH, 'utf8');
     }
-    throw err;
+    // No cache at all — return empty CSV so server doesn’t crash
+    console.warn('[Fallback] No cache available — returning empty lots.');
+    lastFetchTime = now;
+    return '';
   }
 }
 
@@ -559,27 +584,24 @@ app.get('/api/lot/:lotNo', async (req, res) => {
   }
 });
 
-// 7. Retrieve All Lot Synced Options from Google Sheet
+// 7. Retrieve All Lots from MySQL database (replaces Google Sheet dependency)
 app.get('/api/lots', async (req, res) => {
   try {
-    console.log('Fetching Google Sheet data for all lots...');
-    const csvText = await getLotsCSV();
-    const rows = parseCSV(csvText);
-
-    const lots = rows.map(row => {
-      const lotNoVal = row['Lot Number'] || row['Lot No'] || row['Job Order No'] || '';
-      return {
-        lotNo: lotNoVal.trim(),
-        itemName: row['Garment Type'] || row['Style'] || 'Unknown Item'
-      };
-    }).filter(item => item.lotNo);
-
+    const { getAllCuttingHeaders } = await import('./db.js');
+    const headers = await getAllCuttingHeaders();
+    const lots = headers
+      .filter(h => h.Lot_Number)
+      .map(h => ({
+        lotNo: String(h.Lot_Number).trim(),
+        itemName: h.Garment_Type || h.Style || 'Unknown Item'
+      }));
     res.status(200).json(lots);
   } catch (err) {
-    console.error('Google Sheet All Lots Fetch Error:', err.message);
-    res.status(500).json({ error: 'Server failed to retrieve Google Sheet lots.' });
+    console.error('API GET /api/lots error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve lots from database.' });
   }
 });
+
 
 // 8. Image Proxy to cache Google Drive images and avoid 429 Rate Limit errors
 app.get('/api/image-proxy', async (req, res) => {
@@ -674,16 +696,18 @@ app.post('/api/designs', async (req, res) => {
     const isEdit = !!design.isEdit;
     delete design.isEdit;
 
-    // Check if the lot ID already exists. If yes and NOT an edit, auto-version it to save both runs!
+    // Check if the lot ID already exists. If yes and NOT an edit, allocate a new lot number and mark as repeat!
     if (!isEdit) {
       const [existing] = await pool.execute('SELECT id FROM designs WHERE id = ?', [design.id]);
       if (existing.length > 0) {
-        const [versions] = await pool.execute(
-          'SELECT id FROM designs WHERE id LIKE ?',
-          [`${design.id}-V%`]
+        // Find the maximum numeric lot number to assign a brand new sequential lot number
+        const [[{ maxId }]] = await pool.execute(
+          "SELECT MAX(CAST(id AS UNSIGNED)) as maxId FROM designs WHERE id REGEXP '^[0-9]+$'"
         );
-        const nextVersion = versions.length + 2; // Original is 1, first recreated is -V2, next is -V3
-        design.id = `${design.id}-V${nextVersion}`;
+        const nextId = (maxId && maxId >= 11000) ? maxId + 1 : 11000;
+
+        design.repeat_against = design.id; // old lot number (e.g. 11028)
+        design.id = String(nextId);        // brand new lot number (e.g. 11030)
         design.lotNo = design.id;
       }
     }
@@ -794,6 +818,29 @@ app.delete('/api/materials/:id', async (req, res) => {
   }
 });
 
+// GET all transfers log
+app.get('/api/transfers', async (req, res) => {
+  try {
+    const transfers = await getMaterialTransfers();
+    res.status(200).json(transfers);
+  } catch (err) {
+    console.error('API GET /api/transfers error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve transfers log.' });
+  }
+});
+
+// POST record new transfer log
+app.post('/api/transfers', async (req, res) => {
+  try {
+    const t = req.body;
+    await recordMaterialTransfer(t);
+    res.status(201).json({ message: 'Transfer logged successfully.' });
+  } catch (err) {
+    console.error('API POST /api/transfers error:', err.message);
+    res.status(500).json({ error: 'Failed to log transfer.' });
+  }
+});
+
 // ── Approval Request Routes ───────────────────────────────────────────────────
 
 // GET all approval requests
@@ -874,8 +921,17 @@ app.put('/api/pos/:id/status', async (req, res) => {
 app.put('/api/cutting-headers/:lotNo/payload', async (req, res) => {
   try {
     const { lotNo } = req.params;
-    const { zip_payload } = req.body;
-    await updateCuttingHeaderPayload(lotNo, zip_payload);
+    const { zip_payload, po_number } = req.body;
+    // Inject po_number into parsed payload so upsertZipOrder saves it
+    let payloadToSave = zip_payload;
+    if (po_number && zip_payload) {
+      try {
+        const parsed = JSON.parse(zip_payload);
+        parsed.poNumber = po_number;
+        payloadToSave = JSON.stringify(parsed);
+      } catch (_) { }
+    }
+    await updateCuttingHeaderPayload(lotNo, payloadToSave);
     res.status(200).json({ message: 'Zip PO payload updated.' });
   } catch (err) {
     console.error('API PUT /api/cutting-headers/:lotNo/payload error:', err.message);
@@ -892,6 +948,21 @@ app.put('/api/doori-orders/:lotNo/payload', async (req, res) => {
   } catch (err) {
     console.error('API PUT /api/doori-orders/:lotNo/payload error:', err.message);
     res.status(500).json({ error: 'Failed to update Doori PO payload.' });
+  }
+});
+
+// GET next unique PO number (auto-increment per type)
+app.get('/api/po-number/next/:type', async (req, res) => {
+  try {
+    const type = req.params.type; // 'zip' or 'doori'
+    if (!['zip', 'doori'].includes(type)) {
+      return res.status(400).json({ error: 'Type must be zip or doori.' });
+    }
+    const poNumber = await getNextPoNumber(type);
+    res.status(200).json({ poNumber });
+  } catch (err) {
+    console.error('API GET /api/po-number/next error:', err.message);
+    res.status(500).json({ error: 'Failed to generate PO number.' });
   }
 });
 
@@ -984,8 +1055,19 @@ app.post('/api/issue-logs', async (req, res) => {
 // GET cutting matrix and header data by lot number
 app.get('/api/cutting/:lotNo', async (req, res) => {
   try {
-    const lotNo = req.params.lotNo;
-    const result = await getCuttingMatrixByLot(lotNo);
+    const lotNo = req.params.lotNo.trim();
+    let result = await getCuttingMatrixByLot(lotNo);
+
+    // If not found, and lotNo is versioned (e.g. 11028-V2), check if we can duplicate from base lot
+    if (!result && lotNo.includes('-V')) {
+      const baseLot = lotNo.split('-V')[0];
+      const baseResult = await getCuttingMatrixByLot(baseLot);
+      if (baseResult) {
+        await duplicateCuttingHeader(baseLot, lotNo);
+        result = await getCuttingMatrixByLot(lotNo);
+      }
+    }
+
     if (!result) {
       return res.status(200).json({ header: null, rows: [] });
     }
@@ -1072,7 +1154,7 @@ app.get('/api/public/lot/:lotNo', async (req, res) => {
       status: design.status
     });
   } catch (err) {
-    console.error('API GET /api/public/lot/:lotNo error:', err.message);
+    console.error('API GET /api/public/lot/:lotNo error:', err.stack);
     res.status(500).json({ error: 'Failed to retrieve public design/PO info.' });
   }
 });
@@ -1122,6 +1204,39 @@ app.get('/api/doori-orders', async (req, res) => {
   }
 });
 
+// GET all zip orders (Zip POs) from database
+app.get('/api/zip-orders', async (req, res) => {
+  try {
+    const orders = await getAllZipOrders();
+    res.status(200).json(orders);
+  } catch (err) {
+    console.error('API GET /api/zip-orders error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve zip orders.' });
+  }
+});
+
+
+// ── Weight Capture (Weighbridge) API ────────────────────────────────────────
+app.post('/api/weight-capture', async (req, res) => {
+  try {
+    const insertId = await createMaterialCapture(req.body);
+    res.json({ success: true, id: insertId, message: 'Weight capture saved.' });
+  } catch (err) {
+    console.error('[API] weight-capture POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/weight-capture', async (req, res) => {
+  try {
+    const rows = await getAllMaterialCaptures();
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('[API] weight-capture GET error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Serve static assets in production (if built)
 const distPath = path.join(__dirname, '../frontend/dist');
 if (fs.existsSync(distPath)) {
@@ -1134,6 +1249,7 @@ if (fs.existsSync(distPath)) {
   });
 }
 
+
 // Start Server
 const server = app.listen(PORT, () => {
   console.log(`G-PDMS Auth Server running on http://localhost:${PORT} (or https://store-backend-1-ff8d.onrender.com)`);
@@ -1142,11 +1258,11 @@ const server = app.listen(PORT, () => {
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`\n[ERROR] Port ${PORT} is already in use.`);
-    console.error(`To automatically kill the process on port ${PORT} in PowerShell, run:\n`);
+    console.error(`To kill the old process, run in PowerShell:\n`);
     console.error(`    Stop-Process -Id (Get-NetTCPConnection -LocalPort ${PORT}).OwningProcess -Force\n`);
-    process.exit(1);
+    // Don't exit — just log so the user can fix it
   } else {
-    throw err;
+    console.error('[Server Error]', err.message);
   }
 });
 
