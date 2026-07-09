@@ -700,14 +700,14 @@ app.post('/api/designs', async (req, res) => {
     if (!isEdit) {
       const [existing] = await pool.execute('SELECT id FROM designs WHERE id = ?', [design.id]);
       if (existing.length > 0) {
-        // Find the maximum numeric lot number to assign a brand new sequential lot number
+        // Find the maximum numeric lot number in the 20000 range to assign a brand new sequential lot number starting at 20000
         const [[{ maxId }]] = await pool.execute(
-          "SELECT MAX(CAST(id AS UNSIGNED)) as maxId FROM designs WHERE id REGEXP '^[0-9]+$'"
+          "SELECT MAX(CAST(id AS UNSIGNED)) as maxId FROM designs WHERE id REGEXP '^[0-9]+$' AND CAST(id AS UNSIGNED) >= 20000 AND CAST(id AS UNSIGNED) < 30000"
         );
-        const nextId = (maxId && maxId >= 11000) ? maxId + 1 : 11000;
+        const nextId = (maxId && maxId >= 20000) ? maxId + 1 : 20000;
 
         design.repeat_against = design.id; // old lot number (e.g. 11028)
-        design.id = String(nextId);        // brand new lot number (e.g. 11030)
+        design.id = String(nextId);        // brand new lot number (e.g. 20000)
         design.lotNo = design.id;
       }
     }
@@ -1252,7 +1252,7 @@ if (fs.existsSync(distPath)) {
 
 // Start Server
 const server = app.listen(PORT, () => {
-  console.log(`G-PDMS Auth Server running on http://localhost:${PORT} (or https://store-backend-1-ff8d.onrender.com)`);
+  console.log(`G-PDMS Auth Server running on http://localhost:${PORT} (or wait)`);
 });
 
 server.on('error', (err) => {
