@@ -52,7 +52,10 @@ import {
   createMaterialCapture,
   getAllMaterialCaptures,
   recordMaterialTransfer,
-  getMaterialTransfers
+  getMaterialTransfers,
+  createRgp,
+  getRgpByNo,
+  getAllRgps
 } from './db.js';
 import pool from './db.js';
 
@@ -893,6 +896,21 @@ app.get('/api/pos', async (req, res) => {
   }
 });
 
+// GET purchase order by PO number
+app.get('/api/pos/:poNumber', async (req, res) => {
+  try {
+    const { poNumber } = req.params;
+    const po = await getPOByNumberOrId(poNumber);
+    if (!po) {
+      return res.status(404).json({ error: 'Purchase order not found.' });
+    }
+    res.status(200).json(po);
+  } catch (err) {
+    console.error('API GET /api/pos/:poNumber error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve purchase order.' });
+  }
+});
+
 // POST create new purchase order
 app.post('/api/pos', async (req, res) => {
   try {
@@ -1111,6 +1129,49 @@ app.get('/api/scans', async (req, res) => {
   } catch (err) {
     console.error('API GET /api/scans error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve scanned logs.' });
+  }
+});
+
+// ── RGP API Endpoints ────────────────────────────────────────────────────────
+
+// POST a new RGP entry
+app.post('/api/rgp', async (req, res) => {
+  try {
+    const rgpData = req.body;
+    if (!rgpData.rgpNo || !rgpData.vendor || !rgpData.date) {
+      return res.status(400).json({ error: 'RGP Number, Vendor, and Date are required.' });
+    }
+    await createRgp(rgpData);
+    res.status(201).json({ message: 'RGP saved successfully to database!' });
+  } catch (err) {
+    console.error('API POST /api/rgp error:', err.message);
+    res.status(500).json({ error: 'Failed to save RGP.' });
+  }
+});
+
+// GET all RGP entries
+app.get('/api/rgp', async (req, res) => {
+  try {
+    const rgps = await getAllRgps();
+    res.status(200).json(rgps);
+  } catch (err) {
+    console.error('API GET /api/rgp error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve RGPs.' });
+  }
+});
+
+// GET RGP by RGP Number
+app.get('/api/rgp/:rgpNo', async (req, res) => {
+  try {
+    const rgpNo = req.params.rgpNo;
+    const rgp = await getRgpByNo(rgpNo);
+    if (!rgp) {
+      return res.status(404).json({ error: 'RGP not found.' });
+    }
+    res.status(200).json(rgp);
+  } catch (err) {
+    console.error('API GET /api/rgp/:rgpNo error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve RGP.' });
   }
 });
 

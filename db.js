@@ -365,6 +365,24 @@ export async function initDb() {
     dori_payload         LONGTEXT
   )`);
 
+  // Returnable Gate Pass (RGP) Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS rgp (
+    id                   INT PRIMARY KEY AUTO_INCREMENT,
+    rgpNo                VARCHAR(100) NOT NULL UNIQUE,
+    date                 VARCHAR(100) NOT NULL,
+    vendor               VARCHAR(255) NOT NULL,
+    rgpType              VARCHAR(100) NOT NULL,
+    department           VARCHAR(100) DEFAULT '',
+    purpose              VARCHAR(255) DEFAULT '',
+    expectedReturnDate   VARCHAR(100) DEFAULT '',
+    vehicleNo            VARCHAR(100) DEFAULT '',
+    preparedBy           VARCHAR(255) DEFAULT '',
+    authorizedBy         VARCHAR(255) DEFAULT '',
+    remarks              TEXT,
+    entries              TEXT,
+    createdAt            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+
   // ── Seed data (only if tables are empty) ────────────────────────────────────
 
   const [[{ count: dCount }]] = await pool.execute('SELECT COUNT(*) as count FROM designs');
@@ -811,12 +829,26 @@ export const getAllPOs = async () => {
 
 export const createPO = async (po) => {
   const itemsJson = po.items ? JSON.stringify(po.items) : '[]';
+
+  // Auto-generate sequential numeric ID if it is a new PO (id starts with 'PO' or is empty)
+  let finalId = po.id;
+  if (!po.id || String(po.id).startsWith('PO')) {
+    try {
+      const [rows] = await pool.execute('SELECT id FROM purchase_orders');
+      const ids = rows.map(r => parseInt(r.id, 10)).filter(n => !isNaN(n));
+      const maxId = ids.length > 0 ? Math.max(...ids) : 0;
+      finalId = String(maxId + 1);
+    } catch (err) {
+      console.warn("Failed to generate sequential PO ID:", err.message);
+    }
+  }
+
   await pool.execute(
     `REPLACE INTO purchase_orders
       (id,poNumber,vendorName,vendorEmail,vendorAddress,designName,designCategory,
        items,subtotal,taxRate,tax,total,date,deliveryDate,status)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [po.id, po.poNumber, po.vendorName || '', po.vendorEmail || '', po.vendorAddress || '',
+    [finalId, po.poNumber, po.vendorName || '', po.vendorEmail || '', po.vendorAddress || '',
     po.designName || '', po.designCategory || '', itemsJson,
     po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
     po.date || '', po.deliveryDate || '', po.status || 'Draft']
@@ -919,6 +951,20 @@ export const getCuttingMatrixByLot = async (lotNo) => {
     };
   });
 
+  // Query latest doori payload for this lot
+  let dooriPayload = null;
+  try {
+    const [dooriRows] = await pool.execute(
+      'SELECT dori_payload FROM doori WHERE Lot_Number = ? ORDER BY version DESC LIMIT 1',
+      [lotNo]
+    );
+    if (dooriRows.length > 0) {
+      dooriPayload = dooriRows[0].dori_payload || null;
+    }
+  } catch (err) {
+    console.warn('Failed to query latest doori_payload:', err.message);
+  }
+
   return {
     lotNumber: header.Lot_Number,
     style: header.Style || '',
@@ -926,6 +972,8 @@ export const getCuttingMatrixByLot = async (lotNo) => {
     garmentType: header.Garment_Type || '',
     brand: header.Brand || '',
     partyName: header.Party_Name || '',
+    zipPayload: header.zip_payload || null,
+    doriPayload: dooriPayload,
     rows: parsedRows
   };
 };
@@ -1339,6 +1387,39 @@ export const recordMaterialTransfer = async (t) => {
 export const getMaterialTransfers = async () => {
   const [rows] = await pool.execute('SELECT * FROM material_transfers ORDER BY transferredAt DESC');
   return rows;
+};
+
+export const createRgp = async (rgp) => {
+  const entriesJson = rgp.entries ? JSON.stringify(rgp.entries) : '[]';
+  await pool.execute(
+    `INSERT INTO rgp 
+      (rgpNo, date, vendor, rgpType, department, purpose, expectedReturnDate, vehicleNo, preparedBy, authorizedBy, remarks, entries)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+      date=VALUES(date), vendor=VALUES(vendor), rgpType=VALUES(rgpType), department=VALUES(department), 
+      purpose=VALUES(purpose), expectedReturnDate=VALUES(expectedReturnDate), vehicleNo=VALUES(vehicleNo), 
+      preparedBy=VALUES(preparedBy), authorizedBy=VALUES(authorizedBy), remarks=VALUES(remarks), entries=VALUES(entries)`,
+    [
+      rgp.rgpNo, rgp.date, rgp.vendor, rgp.rgpType, rgp.department || '', rgp.purpose || '', 
+      rgp.expectedReturnDate || '', rgp.vehicleNo || '', rgp.preparedBy || '', rgp.authorizedBy || '', 
+      rgp.remarks || '', entriesJson
+    ]
+  );
+};
+
+export const getRgpByNo = async (rgpNo) => {
+  const [rows] = await pool.execute(
+    'SELECT * FROM rgp WHERE rgpNo = ?',
+    [rgpNo]
+  );
+  if (rows.length === 0) return null;
+  const r = rows[0];
+  return { ...r, entries: r.entries ? JSON.parse(r.entries) : [] };
+};
+
+export const getAllRgps = async () => {
+  const [rows] = await pool.execute('SELECT * FROM rgp ORDER BY id DESC');
+  return rows.map(r => ({ ...r, entries: r.entries ? JSON.parse(r.entries) : [] }));
 };
 
 // ── Export pool as default ────────────────────────────────────────────────────
